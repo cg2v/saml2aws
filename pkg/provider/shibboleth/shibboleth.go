@@ -53,6 +53,7 @@ func (sc *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 
 	var authSubmitURL string
 	var samlAssertion string
+	var inputs bool
 
 	shibbolethURL := fmt.Sprintf("%s/idp/profile/SAML2/Unsolicited/SSO?providerId=%s", loginDetails.URL, sc.idpAccount.AmazonWebservicesURN)
 
@@ -68,10 +69,19 @@ func (sc *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 
 	authForm := url.Values{}
 
+	inputs = false
+	var lastsel *goquery.Selection
+
 	doc.Find("input").Each(func(i int, s *goquery.Selection) {
-		updateFormData(authForm, s, loginDetails)
+		if updateFormData(authForm, s, loginDetails) {
+			inputs = true
+			lastsel = s
+		}
 	})
 
+	if inputs {
+		log.Print(*lastsel)
+	}
 	doc.Find("form").Each(func(i int, s *goquery.Selection) {
 		action, ok := s.Attr("action")
 		if !ok {
@@ -97,6 +107,51 @@ func (sc *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 	if err != nil {
 		return samlAssertion, errors.Wrap(err, "error retrieving login form results")
 	}
+	if !inputs {
+		log.Println("Checking second fetch for login form")
+		doc, err := goquery.NewDocumentFromReader(res.Body)
+		if err != nil {
+			return samlAssertion, errors.Wrap(err, "failed to build document from response")
+		}
+
+		authForm := url.Values{}
+
+		inputs = false
+		doc.Find("input").Each(func(i int, s *goquery.Selection) {
+			if updateFormData(authForm, s, loginDetails) {
+				inputs = true
+			}
+		})
+
+		if !inputs {
+			return samlAssertion, errors.New("No form inputs found")
+		}
+		doc.Find("form").Each(func(i int, s *goquery.Selection) {
+			action, ok := s.Attr("action")
+			if !ok {
+				return
+			}
+			authSubmitURL = action
+		})
+
+		if authSubmitURL == "" {
+			return samlAssertion, fmt.Errorf("unable to locate IDP authentication form submit URL")
+		}
+
+		req, err := http.NewRequest("POST", authSubmitURL, strings.NewReader(authForm.Encode()))
+		if err != nil {
+			return samlAssertion, errors.Wrap(err, "error building authentication request")
+		}
+
+		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+		req.URL.Host = res.Request.URL.Host
+		req.URL.Scheme = res.Request.URL.Scheme
+
+		res, err = sc.client.Do(req)
+		if err != nil {
+			return samlAssertion, errors.Wrap(err, "error retrieving login form results")
+		}
+	}
 
 	switch sc.idpAccount.MFA {
 	case "Auto":
@@ -119,28 +174,34 @@ func (sc *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 	return samlAssertion, nil
 }
 
-func updateFormData(authForm url.Values, s *goquery.Selection, user *creds.LoginDetails) {
+func updateFormData(authForm url.Values, s *goquery.Selection, user *creds.LoginDetails) bool {
+	var found bool
 	name, ok := s.Attr("name")
 	authForm.Add("_eventId_proceed", "")
 
 	if !ok {
-		return
+		return false
 	}
+	found = false
 	lname := strings.ToLower(name)
 	if strings.Contains(lname, "user") {
 		authForm.Add(name, user.Username)
+		found = true
 	} else if strings.Contains(lname, "email") {
 		authForm.Add(name, user.Username)
+		found = true
 	} else if strings.Contains(lname, "pass") {
 		authForm.Add(name, user.Password)
+		found = true
 	} else {
 		// pass through any hidden fields
 		val, ok := s.Attr("value")
 		if !ok {
-			return
+			return false
 		}
 		authForm.Add(name, val)
 	}
+	return found
 }
 
 func verifyMfa(oc *Client, loginDetails *creds.LoginDetails, shibbolethHost string, resp string) (*http.Response, error) {
